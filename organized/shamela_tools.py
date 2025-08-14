@@ -9,6 +9,58 @@ from docx import Document
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.shared import Pt
 import difflib
+import concurrent.futures
+
+# --- Stop phrases you want to skip entirely (normalized match) ---
+STOP_PHRASES_RAW = [
+    "بسم الله الرحمن الرحيم",
+    "رضي الله عنه",
+    "رضي الله عنهم",
+    "صلى الله عليه وسلم",
+]
+
+def _build_stop_set(normalize_fn):
+    base = {normalize_fn(p) for p in STOP_PHRASES_RAW}
+    # Optional: add common variants (will be normalized too)
+    variants = {
+        "عليه الصلاة والسلام",
+        "رضي الله عنها",
+        "رضي الله عنهما",
+        "رضي الله عنهن",
+        "رضي الله عنكما",
+    }
+    base |= {normalize_fn(v) for v in variants}
+    return base
+
+# Will be initialized after normalize_ar is defined
+STOP_SET = None
+
+def is_stop_sentence(text: str) -> bool:
+    """
+    Returns True if the sentence is just a conventional formula
+    (e.g., 'بسم الله الرحمن الرحيم', 'صلى الله عليه وسلم', 'رضي الله عنه/عنهم/...').
+    Matching is done on your normalized form to ignore diacritics/punct/variants.
+    """
+    if not text:
+        return True
+    n = normalize_ar(text)
+    if not n:
+        return True
+
+    # exact set match
+    if n in STOP_SET:
+        return True
+
+    # very small regex catch-alls on normalized string:
+    # - 'رضي الله عنX' where X ∈ {ه،ها،هما،هم،هن،كما}
+    if re.fullmatch(r"رضي الله عن(ه|ها|هما|هم|هن|كما)", n):
+        return True
+
+    # - 'اللهم صل على محمد' short forms (optional; comment out if too aggressive)
+    # if "اللهم صل على محمد" in n:
+    #     return True
+
+    return False
 
 # ---------------------------
 # HTTP helpers
@@ -18,6 +70,16 @@ DEFAULT_HEADERS = {
                   "(KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36"
 }
 
+def fetch_shamela_page_html_session(session: requests.Session, book_id: int, page_num: int, timeout: int = 20) -> Optional[str]:
+    url = f"https://shamela.ws/book/{book_id}/{page_num}#p{page_num}"
+    try:
+        r = session.get(url, headers=DEFAULT_HEADERS, timeout=timeout)
+        if r.status_code != 200:
+            return None
+        return r.text
+    except requests.RequestException:
+        return None
+    
 def fetch_shamela_page_html(book_id: int, page_num: int, timeout: int = 20) -> Optional[str]:
     """
     Returns HTML text for a given shamela book page or None if not found.
@@ -30,6 +92,80 @@ def fetch_shamela_page_html(book_id: int, page_num: int, timeout: int = 20) -> O
         return r.text
     except requests.RequestException:
         return None
+
+def extract_book_to_txt_threaded(book_id: int,
+                                 out_dir: str,
+                                 start_page: int = 1,
+                                 max_pages: int = 5000,
+                                 consecutive_empty_to_stop: int = 2,
+                                 batch_size: int = 50,
+                                 max_workers: int = 16) -> int:
+    """
+    Concurrently fetch pages in batches and save as:
+      out_dir/book_page_{i}.txt
+
+    Stops when `consecutive_empty_to_stop` pages IN A ROW (in ascending order)
+    have no content (or missing), or when we reach `max_pages`.
+    Returns count of pages saved.
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    saved = 0
+    empty_streak = 0
+
+    first = start_page
+    last  = start_page + max_pages - 1
+
+    with requests.Session() as session:
+        pbar = tqdm(total=(last - first + 1), desc=f"Book {book_id}: extracting pages (threaded)")
+        current = first
+        while current <= last and empty_streak < consecutive_empty_to_stop:
+            # plan this batch
+            batch_end = min(current + batch_size - 1, last)
+            pages = list(range(current, batch_end + 1))
+
+            # fire requests concurrently
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
+                fut_to_page = {
+                    ex.submit(fetch_shamela_page_html_session, session, book_id, p): p
+                    for p in pages
+                }
+                # collect html
+                html_by_page: Dict[int, Optional[str]] = {}
+                for fut in concurrent.futures.as_completed(fut_to_page):
+                    p = fut_to_page[fut]
+                    try:
+                        html_by_page[p] = fut.result()
+                    except Exception:
+                        html_by_page[p] = None
+
+            # process results in ASCENDING order to maintain correct empty streak logic
+            stop_now = False
+            for p in pages:
+                html = html_by_page.get(p)
+                if not html:
+                    empty_streak += 1
+                else:
+                    text = extract_text_from_shamela_html(html)
+                    if not text:
+                        empty_streak += 1
+                    else:
+                        empty_streak = 0
+                        save_text(os.path.join(out_dir, f"book_page_{p}.txt"), text)
+                        saved += 1
+
+                pbar.update(1)
+                if empty_streak >= consecutive_empty_to_stop:
+                    stop_now = True
+                    break
+
+            if stop_now:
+                break
+
+            current = batch_end + 1
+
+        pbar.close()
+
+    return saved
 
 def extract_text_from_shamela_html(html: str) -> Optional[str]:
     """
@@ -198,14 +334,19 @@ def normalize_ar(text: str) -> str:
     t = re.sub(r"\s+", " ", t).strip()
     return t
 
+# Build the normalized stop set now that normalize_ar exists
+if STOP_SET is None:
+    STOP_SET = _build_stop_set(normalize_ar)
+    
 def iter_docx_sentences(docx_path: str) -> List[Dict]:
     """
     Returns list of dicts: {"raw": str, "norm": str, "pos": "page:X"}
     Page counting uses manual page breaks we inserted.
+    Skips conventional formula sentences (e.g., 'بسم الله الرحمن الرحيم', 'صلى الله عليه وسلم', ...).
     """
     doc = Document(docx_path)
     page_no = 1
-    results = []
+    results: List[Dict] = []
     para_idx = 0
 
     from docx.oxml.ns import qn
@@ -225,6 +366,10 @@ def iter_docx_sentences(docx_path: str) -> List[Dict]:
         for s in parts:
             if len(s) < 12:
                 continue
+            # NEW: skip conventional formulas
+            if is_stop_sentence(s):
+                continue
+
             results.append({
                 "raw": s,
                 "norm": normalize_ar(s),
@@ -247,16 +392,31 @@ def match_books_sequential(book1_docx: str,
                            score_threshold: int = 60) -> None:
     """
     Compare sentences from book1 to book2 using RapidFuzz and write CSV.
+    Skips conventional formula sentences on both sides.
     """
     from rapidfuzz import process, fuzz
 
-    book1_sents = iter_docx_sentences(book1_docx)
-    book2_sents = iter_docx_sentences(book2_docx)
+    # Extract and filter stop sentences up front
+    book1_sents_all = iter_docx_sentences(book1_docx)
+    book2_sents_all = iter_docx_sentences(book2_docx)
+
+    book1_sents = [
+        s for s in book1_sents_all
+        if not is_stop_sentence(s["raw"]) and len(s["raw"]) >= min_len_chars and len(s["norm"].split()) >= 4
+    ]
+    book2_sents = [
+        s for s in book2_sents_all
+        if not is_stop_sentence(s["raw"]) and len(s["raw"]) >= min_len_chars and len(s["norm"].split()) >= 4
+    ]
+
     book2_norms = [s["norm"] for s in book2_sents]
 
     rows: List[Tuple[str, str, str, str, int, int]] = []
 
     for s1 in tqdm(book1_sents, desc="Matching sequentially"):
+        # (guards already applied above, but keep them if you later reuse this loop elsewhere)
+        if is_stop_sentence(s1["raw"]):
+            continue
         if len(s1["raw"]) < min_len_chars:
             continue
         if len(s1["norm"].split()) < 4:
@@ -415,9 +575,23 @@ def run_full_pipeline(book1_id: int,
     b2_dir = os.path.join(workdir, f"book_{book2_id}", "book")
 
     # 1) Extract pages
-    extract_book_to_txt(book1_id, b1_dir, max_pages=max_pages, consecutive_empty_to_stop=stop_after_empty)
-    extract_book_to_txt(book2_id, b2_dir, max_pages=max_pages, consecutive_empty_to_stop=stop_after_empty)
-
+    # extract_book_to_txt(book1_id, b1_dir, max_pages=max_pages, consecutive_empty_to_stop=stop_after_empty)
+    # extract_book_to_txt(book2_id, b2_dir, max_pages=max_pages, consecutive_empty_to_stop=stop_after_empty)
+    # 1) Extract pages (threaded)
+    extract_book_to_txt_threaded(
+        book1_id, b1_dir,
+        max_pages=max_pages,
+        consecutive_empty_to_stop=stop_after_empty,
+        batch_size=50,
+        max_workers=50
+    )
+    extract_book_to_txt_threaded(
+        book2_id, b2_dir,
+        max_pages=max_pages,
+        consecutive_empty_to_stop=stop_after_empty,
+        batch_size=50,
+        max_workers=50
+    )
     # 2) DOCX build
     b1_docx = os.path.join(workdir, f"book_{book1_id}", "combined_book.docx")
     b2_docx = os.path.join(workdir, f"book_{book2_id}", "combined_book.docx")
@@ -432,9 +606,9 @@ def run_full_pipeline(book1_id: int,
     final_csv = os.path.join(workdir, f"matches_{book1_id}_vs_{book2_id}_with_pages.csv")
     update_csv_with_pages(
         raw_csv, final_csv,
-        b1_pages_dir=b1_dir, b2_pages_dir=b2_dir,
+        book1_pages_dir=b1_dir, book2_pages_dir=b2_dir,
         book1_use_fuzzy=use_fuzzy_backmap, book2_use_fuzzy=use_fuzzy_backmap,
-        cols=("pos_in_book1","pos_in_book2","sentence_book1","sentence_book2")  # columns we wrote above
+        cols=("pos_in_book1","pos_in_book2","sentence_book1","sentence_book2")
     )
 
     return {

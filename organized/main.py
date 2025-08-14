@@ -3,14 +3,14 @@
 from shamela_tools import run_full_pipeline
 
 # === Set your book IDs here ===
-book1_id = 98087
+book1_id = 8370
 book2_id = 9472
 
 # === Settings ===
 workdir = "output"
 max_pages = 5000
 stop_after_empty = 2
-score_threshold = 60
+score_threshold = 70
 min_len_chars = 24
 use_fuzzy_backmap = False  # Set True if you want fuzzy mapping of page numbers
 
