@@ -578,20 +578,20 @@ def run_full_pipeline(book1_id: int,
     # extract_book_to_txt(book1_id, b1_dir, max_pages=max_pages, consecutive_empty_to_stop=stop_after_empty)
     # extract_book_to_txt(book2_id, b2_dir, max_pages=max_pages, consecutive_empty_to_stop=stop_after_empty)
     # 1) Extract pages (threaded)
-    extract_book_to_txt_threaded(
-        book1_id, b1_dir,
-        max_pages=max_pages,
-        consecutive_empty_to_stop=stop_after_empty,
-        batch_size=50,
-        max_workers=50
-    )
-    extract_book_to_txt_threaded(
-        book2_id, b2_dir,
-        max_pages=max_pages,
-        consecutive_empty_to_stop=stop_after_empty,
-        batch_size=50,
-        max_workers=50
-    )
+    # extract_book_to_txt_threaded(
+    #     book1_id, b1_dir,
+    #     max_pages=max_pages,
+    #     consecutive_empty_to_stop=stop_after_empty,
+    #     batch_size=50,
+    #     max_workers=50
+    # )
+    # extract_book_to_txt_threaded(
+    #     book2_id, b2_dir,
+    #     max_pages=max_pages,
+    #     consecutive_empty_to_stop=stop_after_empty,
+    #     batch_size=50,
+    #     max_workers=50
+    # )
     # 2) DOCX build
     b1_docx = os.path.join(workdir, f"book_{book1_id}", "combined_book.docx")
     b2_docx = os.path.join(workdir, f"book_{book2_id}", "combined_book.docx")
